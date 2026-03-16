@@ -2,63 +2,68 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
-	"sync"
 
 	"github.com/ismaililgar/kuhub-scheduler/internal/job"
 )
 
-type Pool struct {
-	workerCount int
-	jobChan     chan job.Job
-	wg          sync.WaitGroup
+type JobRequest struct {
+	Job        job.Job
+	ResultChan chan error
 }
 
-func NewPool(workerCount int, bufferSize int) *Pool {
+type Pool struct {
+	jobChan chan JobRequest
+	workers int
+}
+
+func NewPool(workers, bufferSize int) *Pool {
 	return &Pool{
-		workerCount: workerCount,
-		jobChan:     make(chan job.Job, bufferSize),
+		jobChan: make(chan JobRequest, bufferSize),
+		workers: workers,
 	}
 }
 
 func (p *Pool) Start(ctx context.Context) {
-	for i := 0; i < p.workerCount; i++ {
-		p.wg.Add(1)
-
-		go func(workerId int) {
-			defer p.wg.Done()
-
-			slog.Info("Worker başlatıldı", "workerId", workerId)
-
+	for i := 0; i < p.workers; i++ {
+		workerID := i
+		go func() {
+			slog.Info("Worker başlatıldı", "workerId", workerID)
 			for {
 				select {
-				case j, ok := <-p.jobChan:
+				case req, ok := <-p.jobChan:
 					if !ok {
-						slog.Info("Worker durdu", "workerID", workerId)
 						return
 					}
-					slog.Info("Worker job alıyor", "workerID", workerId, "job", j.Name())
-					if err := j.Execute(ctx); err != nil {
-						slog.Error("Job başarısız", "workerID", workerId, "job", j.Name(), "error", err)
+					slog.Info("Worker job alıyor", "workerId", workerID, "job", req.Job.Name())
+					err := req.Job.Execute(ctx)
+					if err != nil {
+						slog.Error("Worker job başarısız", "workerID", workerID, "job", req.Job.Name(), "error", err)
 					} else {
-						slog.Info("Worker job tamamlandı", "workerID", workerId, "job", j.Name())
+						slog.Info("Worker job tamamlandı", "workerID", workerID, "job", req.Job.Name())
 					}
-
+					req.ResultChan <- err
 				case <-ctx.Done():
-					slog.Info("Worker context iptal, durdu", "workerID", workerId)
 					return
 				}
 			}
-		}(i)
+		}()
 	}
 }
 
-func (p *Pool) Submit(j job.Job) {
-	p.jobChan <- j
+func (p *Pool) Submit(j job.Job) error {
+	resultChan := make(chan error, 1)
+
+	req := JobRequest{Job: j, ResultChan: resultChan}
+	select {
+	case p.jobChan <- req:
+		return <-resultChan
+	default:
+		return fmt.Errorf("job kuyruğu dolu, %s kabul edilemedi", j.Name())
+	}
 }
 
 func (p *Pool) Stop() {
 	close(p.jobChan)
-	p.wg.Wait()
-	slog.Info("Tüm workerlar durdu")
 }
